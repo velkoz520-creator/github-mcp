@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+import { timingSafeEqual } from 'crypto';
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER || '';
@@ -500,7 +501,9 @@ function createServer() {
 const app = express();
 
 app.use((req, res, next) => {
-  console.log(`[请求到达] ${req.method} ${req.url}`);
+  // 地址栏里的 key= 不进日志
+  const safeUrl = String(req.url).replace(/([?&]key=)[^&]+/, '$1***');
+  console.log(`[请求到达] ${req.method} ${safeUrl}`);
   next();
 });
 
@@ -510,6 +513,34 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
+});
+
+// 访问控制：MCP 路由一律要钥匙；没配钥匙就全部拒绝（不放行）。
+// 钥匙在环境变量 MCP_BEARER_TOKEN；请求头 Authorization: Bearer <钥匙>，或地址栏 ?key=<钥匙>。
+const MCP_BEARER_TOKEN = process.env.MCP_BEARER_TOKEN || '';
+const MCP_PATHS = new Set(['/mcp', '/sse', '/messages']);
+
+function tokenMatches(candidate) {
+  if (!MCP_BEARER_TOKEN || typeof candidate !== 'string') return false;
+  const given = Buffer.from(candidate);
+  const expected = Buffer.from(MCP_BEARER_TOKEN);
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
+
+app.use((req, res, next) => {
+  if (!MCP_PATHS.has(req.path)) return next();
+  if (!MCP_BEARER_TOKEN) {
+    console.error('[鉴权] 未配置 MCP_BEARER_TOKEN，拒绝请求');
+    return res.status(503).json({ error: 'server token not configured' });
+  }
+  const header = req.headers.authorization || '';
+  const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const queryKey = typeof req.query.key === 'string' ? req.query.key : '';
+  if (!tokenMatches(bearer) && !tokenMatches(queryKey)) {
+    console.warn(`[鉴权] 拒绝 ${req.method} ${req.path}`);
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  return next();
 });
 
 const jsonParser = express.json();
